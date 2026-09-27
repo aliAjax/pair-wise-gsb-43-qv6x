@@ -154,6 +154,32 @@ class ProcurementService:
                     created_at TEXT NOT NULL,
                     resolved_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS qualifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    materials TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    review_comment TEXT NOT NULL DEFAULT '',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    submitted_by TEXT NOT NULL,
+                    submitted_at TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    UNIQUE(tender_id,vendor_id)
+                );
+                CREATE TABLE IF NOT EXISTS qualification_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    qualification_id INTEGER NOT NULL REFERENCES qualifications(id),
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    action TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    comment TEXT NOT NULL DEFAULT '',
+                    actor TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS timeline (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     tender_id INTEGER REFERENCES tenders(id),
@@ -164,8 +190,13 @@ class ProcurementService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
+                CREATE INDEX IF NOT EXISTS idx_qual_tender ON qualifications(tender_id,status);
+                CREATE INDEX IF NOT EXISTS idx_qual_events ON qualification_events(qualification_id);
                 """
             )
+            bid_columns = {row["name"] for row in conn.execute("PRAGMA table_info(bids)")}
+            if "status_reason" not in bid_columns:
+                conn.execute("ALTER TABLE bids ADD COLUMN status_reason TEXT")
 
     def _audit(self, conn: sqlite3.Connection, tender_id: int | None, actor: str,
                action: str, details: dict[str, Any]) -> None:
@@ -251,6 +282,133 @@ class ProcurementService:
             self._audit(conn, tender_id, actor, "tender.published", {"deadline": tender["deadline"]})
             return dict(self._tender(conn, tender_id))
 
+    @staticmethod
+    def _qualification_failure_reason(qualification: sqlite3.Row | None) -> str:
+        if qualification is None:
+            return "资格审查未通过：未提交资格预审材料"
+        comment = qualification["review_comment"] or "无审核意见"
+        if qualification["status"] == "revoked":
+            return "资格审查未通过：资格已被撤销（%s）" % comment
+        if qualification["status"] == "rejected":
+            return "资格审查未通过：材料审核未通过（%s）" % comment
+        return "资格审查未通过：材料未在开标前完成审核"
+
+    def _record_qualification_event(self, conn: sqlite3.Connection, qualification_id: int,
+                                    actor: str, action: str, comment: str = "") -> None:
+        row = conn.execute("SELECT * FROM qualifications WHERE id=?", (qualification_id,)).fetchone()
+        conn.execute(
+            """INSERT INTO qualification_events(qualification_id,tender_id,vendor_id,action,status,comment,actor,version,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (qualification_id, row["tender_id"], row["vendor_id"], action,
+             row["status"], comment, actor, row["version"], utcnow()),
+        )
+
+    def submit_qualification(self, actor: str, role: str, tender_id: int, vendor_id: int,
+                             materials: dict[str, Any]) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"vendor"}, "提交资格预审材料")
+        if not isinstance(materials, dict) or not materials:
+            raise DomainError("资格材料必须是非空对象")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["status"] != "published":
+                raise DomainError("当前项目不接受资格预审材料", 409)
+            if datetime.now(timezone.utc) >= parse_time(tender["deadline"]):
+                raise DomainError("投标截止时间已过，不能提交资格材料", 409)
+            if not conn.execute("SELECT 1 FROM vendors WHERE id=?", (vendor_id,)).fetchone():
+                raise DomainError("供应商不存在", 404)
+            materials_text = json.dumps(materials, ensure_ascii=False, sort_keys=True)
+            existing = conn.execute(
+                "SELECT * FROM qualifications WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)
+            ).fetchone()
+            if existing:
+                if existing["status"] == "pending":
+                    raise DomainError("资格材料已提交，请等待审核", 409)
+                if existing["status"] == "approved":
+                    raise DomainError("资格预审已通过，无需重复提交", 409)
+                conn.execute(
+                    """UPDATE qualifications SET materials=?,status='pending',review_comment='',
+                          reviewed_by=NULL,reviewed_at=NULL,submitted_by=?,submitted_at=?,version=version+1 WHERE id=?""",
+                    (materials_text, actor, utcnow(), existing["id"]),
+                )
+                qualification_id = existing["id"]
+                action = "resubmitted"
+            else:
+                cur = conn.execute(
+                    """INSERT INTO qualifications(tender_id,vendor_id,materials,submitted_by,submitted_at)
+                       VALUES(?,?,?,?,?)""",
+                    (tender_id, vendor_id, materials_text, actor, utcnow()),
+                )
+                qualification_id = cur.lastrowid
+                action = "submitted"
+            self._record_qualification_event(conn, qualification_id, actor, action)
+            self._audit(conn, tender_id, actor, "qualification." + action,
+                        {"qualification_id": qualification_id, "vendor_id": vendor_id})
+            return dict(conn.execute("SELECT * FROM qualifications WHERE id=?", (qualification_id,)).fetchone())
+
+    def review_qualification(self, actor: str, role: str, qualification_id: int, decision: str,
+                             comment: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"procurement", "supervisor"}, "审核资格预审材料")
+        if decision not in {"approved", "rejected"}:
+            raise DomainError("审核结论只支持 approved 或 rejected")
+        comment = (comment or "").strip()
+        if decision == "rejected" and not comment:
+            raise DomainError("审核不通过必须填写审核意见")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            qualification = conn.execute(
+                "SELECT * FROM qualifications WHERE id=?", (qualification_id,)
+            ).fetchone()
+            if not qualification:
+                raise DomainError("资格预审记录不存在", 404)
+            tender = self._tender(conn, qualification["tender_id"])
+            if tender["status"] != "published":
+                raise DomainError("项目当前不能审核资格", 409)
+            if qualification["status"] != "pending":
+                raise DomainError("资格材料已审核，不能重复处理", 409)
+            conn.execute(
+                """UPDATE qualifications SET status=?,review_comment=?,reviewed_by=?,reviewed_at=?,version=version+1 WHERE id=?""",
+                (decision, comment, actor, utcnow(), qualification_id),
+            )
+            self._record_qualification_event(conn, qualification_id, actor, decision, comment)
+            self._audit(conn, qualification["tender_id"], actor, "qualification.reviewed",
+                        {"qualification_id": qualification_id, "vendor_id": qualification["vendor_id"], "decision": decision})
+            return dict(conn.execute("SELECT * FROM qualifications WHERE id=?", (qualification_id,)).fetchone())
+
+    def revoke_qualification(self, actor: str, role: str, qualification_id: int, reason: str) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"procurement", "supervisor"}, "撤销资格预审结果")
+        reason = (reason or "").strip()
+        if not reason:
+            raise DomainError("撤销资格必须填写原因")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            qualification = conn.execute(
+                "SELECT * FROM qualifications WHERE id=?", (qualification_id,)
+            ).fetchone()
+            if not qualification:
+                raise DomainError("资格预审记录不存在", 404)
+            tender = self._tender(conn, qualification["tender_id"])
+            if tender["status"] != "published":
+                raise DomainError("项目已开标，投标资格问题请通过废标处理", 409)
+            if qualification["status"] != "approved":
+                raise DomainError("只有已通过的资格可以撤销", 409)
+            sealed_bids = conn.execute(
+                "SELECT COUNT(*) AS c FROM bids WHERE tender_id=? AND vendor_id=? AND status='sealed'",
+                (qualification["tender_id"], qualification["vendor_id"]),
+            ).fetchone()["c"]
+            conn.execute(
+                """UPDATE qualifications SET status='revoked',review_comment=?,reviewed_by=?,reviewed_at=?,version=version+1 WHERE id=?""",
+                (reason, actor, utcnow(), qualification_id),
+            )
+            self._record_qualification_event(conn, qualification_id, actor, "revoked", reason)
+            self._audit(conn, qualification["tender_id"], actor, "qualification.revoked",
+                        {"qualification_id": qualification_id, "vendor_id": qualification["vendor_id"],
+                         "reason": reason, "sealed_bids_retained": sealed_bids})
+            return dict(conn.execute("SELECT * FROM qualifications WHERE id=?", (qualification_id,)).fetchone())
+
     def submit_bid(self, actor: str, role: str, tender_id: int, vendor_id: int,
                    payload: dict[str, Any], price: float, expected_version: int | None = None) -> dict[str, Any]:
         actor = clean_actor(actor)
@@ -273,6 +431,11 @@ class ProcurementService:
             vendor = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
             if not vendor:
                 raise DomainError("供应商不存在", 404)
+            qualification = conn.execute(
+                "SELECT * FROM qualifications WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)
+            ).fetchone()
+            if not qualification or qualification["status"] != "approved":
+                raise DomainError("供应商尚未通过资格预审，不能投标", 409)
             if not conn.execute("SELECT 1 FROM conflicts WHERE tender_id=? AND vendor_id=? AND evaluator=?", (tender_id, vendor_id, actor)).fetchone():
                 pass
             existing = conn.execute("SELECT * FROM bids WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)).fetchone()
@@ -335,15 +498,31 @@ class ProcurementService:
                 raise DomainError("尚未到开标时间", 409)
             rows = conn.execute("SELECT * FROM bids WHERE tender_id=? AND status='sealed' ORDER BY id", (tender_id,)).fetchall()
             opened = []
+            failed = 0
             now = utcnow()
             for row in rows:
                 digest = canonical_hash(json.loads(row["payload"]))
                 if digest != row["payload_hash"]:
                     raise DomainError("投标完整性校验失败: %s" % row["id"], 409)
-                conn.execute("UPDATE bids SET status='opened',opened_at=?,version=version+1 WHERE id=?", (now, row["id"]))
+                qualification = conn.execute(
+                    "SELECT * FROM qualifications WHERE tender_id=? AND vendor_id=?", (tender_id, row["vendor_id"])
+                ).fetchone()
+                if qualification and qualification["status"] == "approved":
+                    conn.execute("UPDATE bids SET status='opened',opened_at=?,version=version+1 WHERE id=?", (now, row["id"]))
+                else:
+                    # 资格预审未通过（如开标前被撤销）：原投标保留，仅标记失败原因，不参与评分授标
+                    reason = self._qualification_failure_reason(qualification)
+                    conn.execute(
+                        "UPDATE bids SET status='qualification_failed',status_reason=?,opened_at=?,version=version+1 WHERE id=?",
+                        (reason, now, row["id"]),
+                    )
+                    failed += 1
+                    self._audit(conn, tender_id, actor, "bid.qualification_failed",
+                                {"bid_id": row["id"], "vendor_id": row["vendor_id"], "reason": reason})
                 opened.append(dict(conn.execute("SELECT * FROM bids WHERE id=?", (row["id"],)).fetchone()))
             conn.execute("UPDATE tenders SET status='opened',version=version+1,updated_at=? WHERE id=?", (now, tender_id))
-            self._audit(conn, tender_id, actor, "tender.opened", {"bid_count": len(opened)})
+            self._audit(conn, tender_id, actor, "tender.opened",
+                        {"bid_count": len(opened), "qualification_failed": failed})
             return {"tender": dict(self._tender(conn, tender_id)), "bids": opened}
 
     def declare_conflict(self, actor: str, role: str, tender_id: int, evaluator: str,
@@ -582,7 +761,30 @@ class ProcurementService:
                 "SELECT id,tender_id,vendor_id,question,answer,status,answered_at FROM clarifications WHERE tender_id=? AND status='published' ORDER BY id",
                 (tender_id,),
             ).fetchall()]
-            return {"tender": tender, "bids": bids, "clarifications": clarifications}
+            if role in {"procurement", "supervisor", "auditor"}:
+                qual_rows = conn.execute(
+                    """SELECT q.*,v.vendor_no,v.name AS vendor_name FROM qualifications q
+                       JOIN vendors v ON v.id=q.vendor_id WHERE q.tender_id=? ORDER BY q.id""",
+                    (tender_id,),
+                ).fetchall()
+            elif role == "vendor":
+                qual_rows = conn.execute(
+                    """SELECT q.*,v.vendor_no,v.name AS vendor_name FROM qualifications q
+                       JOIN vendors v ON v.id=q.vendor_id WHERE q.tender_id=? AND q.submitted_by=? ORDER BY q.id""",
+                    (tender_id, actor),
+                ).fetchall()
+            else:
+                qual_rows = []
+            qualifications = []
+            for row in qual_rows:
+                item = dict(row)
+                item["materials"] = json.loads(item["materials"])
+                item["events"] = [dict(e) for e in conn.execute(
+                    "SELECT action,status,comment,actor,version,created_at FROM qualification_events WHERE qualification_id=? ORDER BY id",
+                    (row["id"],),
+                ).fetchall()]
+                qualifications.append(item)
+            return {"tender": tender, "bids": bids, "clarifications": clarifications, "qualifications": qualifications}
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
@@ -592,7 +794,7 @@ class ProcurementService:
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 200").fetchall()]
             if role in {"procurement", "supervisor", "auditor"}:
                 bids = [dict(r) for r in conn.execute(
-                    """SELECT b.id,b.tender_id,b.vendor_id,b.price,b.status,b.payload_hash,b.submitted_at,b.opened_at,
+                    """SELECT b.id,b.tender_id,b.vendor_id,b.price,b.status,b.status_reason,b.payload_hash,b.submitted_at,b.opened_at,
                               CASE WHEN t.status IN ('opened','reevaluation','awarded') THEN b.payload ELSE NULL END AS payload
                        FROM bids b JOIN tenders t ON t.id=b.tender_id ORDER BY b.id DESC LIMIT 200"""
                 ).fetchall()]
@@ -628,6 +830,11 @@ class ProcurementService:
              {"name": "质量", "weight": 40, "kind": "direct", "max_value": 100}],
         )
         published = self.publish_tender("proc-demo", "procurement", tender["id"], tender["version"])
+        qualification = self.submit_qualification(
+            "vendor-demo", "vendor", tender["id"], vendor["id"],
+            {"营业执照": "已核验", "财务报告": "已核验", "社保记录": "已核验"},
+        )
+        self.review_qualification("proc-demo", "procurement", qualification["id"], "approved", "材料齐全，符合资格预审要求")
         self.submit_bid("vendor-demo", "vendor", tender["id"], vendor["id"], {"价格": 900000, "质量": 90}, 900000)
         return {"seeded": True, "tender_id": tender["id"], "vendor_id": vendor["id"], "published_version": published["version"]}
 
@@ -694,6 +901,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.create_tender(actor, role, **data)
             elif path == "/api/tenders/publish":
                 result = self.service.publish_tender(actor, role, **data)
+            elif path == "/api/qualifications":
+                result = self.service.submit_qualification(actor, role, **data)
+            elif path == "/api/qualifications/review":
+                result = self.service.review_qualification(actor, role, **data)
+            elif path == "/api/qualifications/revoke":
+                result = self.service.revoke_qualification(actor, role, **data)
             elif path == "/api/bids":
                 result = self.service.submit_bid(actor, role, **data)
             elif path == "/api/bids/withdraw":

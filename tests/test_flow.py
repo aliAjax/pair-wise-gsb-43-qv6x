@@ -23,6 +23,13 @@ class ProcurementFlowTest(unittest.TestCase):
             "proc1", "procurement", "T-001", "数据中心设备", (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat(), criteria
         )
         self.tender = self.service.publish_tender("proc1", "procurement", self.tender["id"], self.tender["version"])
+        for vendor, actor in ((self.vendor1, "vendor1"), (self.vendor2, "vendor2")):
+            qualification = self.service.submit_qualification(
+                actor, "vendor", self.tender["id"], vendor["id"], {"资质文件": "已上传"}
+            )
+            self.service.review_qualification(
+                "proc1", "procurement", self.tender["id"], vendor["id"], "approved", "材料齐全", qualification["version"]
+            )
 
     def tearDown(self):
         self.tmp.cleanup()
